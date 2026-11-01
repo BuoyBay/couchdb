@@ -1,0 +1,584 @@
+' A source-only CouchDB client. HTTP calls block the calling thread.
+Import CouchDBHTTP
+
+Declare Function CouchDBFindByte Lib "c" Alias "memchr" (data As Ptr, value As Int32, count As UInt64) As Ptr
+Declare Function CouchDBCompareBytes Lib "c" Alias "memcmp" (leftData As Ptr, rightData As Ptr, count As UInt64) As Int32
+
+''' One named binary attachment. The upload method generates metadata and MIME parts.
+Public Class CouchDBAttachment
+    Public Property Name As String
+    Public Property ContentType As String
+    Public Property Data As Bytes
+
+    Public Sub Constructor(name As String, data As Bytes, contentType As String = "application/octet-stream")
+        Me.Name = name
+        Me.Data = data
+        Me.ContentType = contentType
+    End Sub
+End Class
+
+Private Function ContainsBoundary(data As Bytes, boundary As Bytes) As Boolean
+    Dim remaining As Integer = data.Count - boundary.Count + 1
+    Dim cursor As Ptr = data.DataPtr()
+    While remaining > 0
+        Dim found As Ptr = CouchDBFindByte(cursor, boundary.Item(0), remaining)
+        If found = Nil Then
+            Return False
+        End If
+        If CouchDBCompareBytes(found, boundary.DataPtr(), boundary.Count) = 0 Then
+            Return True
+        End If
+        Dim skipped As Integer = CType(found, Integer) - CType(cursor, Integer) + 1
+        remaining -= skipped
+        cursor = CType(CType(found, Integer) + 1, Ptr)
+    End While
+    Return False
+End Function
+
+Private Function IsMediaToken(value As String) As Boolean
+    If value = "" Then
+        Return False
+    End If
+    For Each character As String In String.Chars(value)
+        Dim code As Integer = String.Asc(character)
+        If Not ((code >= 65 And code <= 90) Or (code >= 97 And code <= 122) Or (code >= 48 And code <= 57)) Then
+            If Not String.Contains("!#$%&'*+-.^_`|~", character, True) Then
+                Return False
+            End If
+        End If
+    Next
+    Return True
+End Function
+
+Private Sub ValidateContentType(contentType As String)
+    Dim typeAndParameters As Array Of String = String.Split(contentType, ";", 2)
+    Dim mediaParts As Array Of String = String.Split(String.Trim(typeAndParameters(0)), "/")
+    If Array.Count(mediaParts) <> 2 Then
+        Throw New InvalidArgumentException("Attachment content type must be a MIME media type")
+    End If
+    If Not IsMediaToken(mediaParts(0)) Or Not IsMediaToken(mediaParts(1)) Then
+        Throw New InvalidArgumentException("Attachment content type must be a MIME media type")
+    End If
+    For Each character As String In String.Chars(contentType)
+        Dim code As Integer = String.Asc(character)
+        If code < 32 Or code > 126 Then
+            Throw New InvalidArgumentException("Attachment content type must contain printable ASCII only")
+        End If
+    Next
+End Sub
+
+' Error bodies are normally JSON, but never let an undecodable body hide the HTTP status.
+Private Function ResponseText(data As Bytes) As String
+    Try
+        Return data.ToString(Text.Encodings.UTF8)
+    Catch e As EncodingException
+        Return data.ToString(Text.Encodings.Latin1)
+    End Try
+End Function
+
+Private Function IsExactly(value As String, expected As String) As Boolean
+    Return String.Compare(value, expected, True) = 0
+End Function
+
+''' An HTTP failure, including CouchDB's error fields and the unmodified response.
+Public Class CouchDBException Inherits Exception
+    Public Property Status As Integer
+    Public Property ErrorName As String
+    Public Property Reason As String
+    Public Property ResponseBody As String
+
+    Public Sub Constructor(status As Integer, body As String)
+        Super.Constructor("CouchDB HTTP " + Str(status), status)
+        Me.Status = status
+        Me.ResponseBody = body
+        Dim parsed As Optional Of JSONItem = Json.TryParse(body)
+        If parsed.HasValue Then
+            Me.ErrorName = parsed.Value.Value("error").AsString().Or("")
+            Me.Reason = parsed.Value.Value("reason").AsString().Or("")
+        End If
+    End Sub
+End Class
+
+''' Encode one URL component using UTF-8 bytes and RFC 3986 unreserved characters.
+Public Function EncodeComponent(value As String) As String
+    Dim data As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    Dim encoded As String = ""
+    Const HexDigits As String = "0123456789ABCDEF"
+    For i As Integer = 0 To data.Count - 1
+        Dim b As Integer = data.Item(i)
+        If (b >= 65 And b <= 90) Or (b >= 97 And b <= 122) Or (b >= 48 And b <= 57) Or b = 45 Or b = 46 Or b = 95 Or b = 126 Then
+            encoded += String.Chr(b)
+        Else
+            encoded += "%" + String.Mid(HexDigits, (b \ 16) + 1, 1) + String.Mid(HexDigits, (b Mod 16) + 1, 1)
+        End If
+    Next
+    Return encoded
+End Function
+
+''' Reusable client for a server URL, optionally including a reverse proxy prefix.
+Public Class CouchDBClient
+    Private Property ServerURL As String
+    Private Property Authorization As String
+    Public Property TimeoutSeconds As Integer = 30
+
+    Public Sub Constructor(baseURL As String = "http://127.0.0.1:5984", username As String = "", password As String = "")
+        Dim normalized As String = String.Trim(baseURL)
+        While String.Right(normalized, 1) = "/"
+            normalized = String.Left(normalized, String.Len(normalized) - 1)
+        End While
+        If Not String.Left(normalized, 7) = "http://" And Not String.Left(normalized, 8) = "https://" Then
+            Throw New InvalidArgumentException("CouchDB URL must start with http:// or https://")
+        End If
+        Dim authority As String = String.Mid(normalized, String.IndexOf(normalized, "://") + 4)
+        If authority = "" Or String.Left(authority, 1) = "/" Or String.IndexOf(normalized, "?") >= 0 Or String.IndexOf(normalized, "#") >= 0 Or String.IndexOf(normalized, "@") >= 0 Then
+            Throw New InvalidArgumentException("Use a server URL without userinfo, query, or fragment")
+        End If
+        For Each character As String In String.Chars(normalized)
+            Dim code As Integer = String.Asc(character)
+            If code <= 32 Or code = 127 Then
+                Throw New InvalidArgumentException("CouchDB URL cannot contain whitespace or control characters")
+            End If
+        Next
+        Me.ServerURL = normalized
+        If String.IndexOf(username, ":") >= 0 Then
+            Throw New InvalidArgumentException("Basic authentication username cannot contain a colon")
+        End If
+        If username <> "" Or password <> "" Then
+            Dim credentials As Bytes = Bytes.FromString(username + ":" + password, Text.Encodings.UTF8)
+            Me.Authorization = "Basic " + credentials.ToBase64()
+        End If
+    End Sub
+
+    Private Function DatabasePath(database As String) As String
+        If database = "" Then
+            Throw New InvalidArgumentException("Database name is required")
+        End If
+        Return "/" + EncodeComponent(database)
+    End Function
+
+    Private Function DocumentPath(database As String, documentID As String) As String
+        If documentID = "" Then
+            Throw New InvalidArgumentException("Document ID is required")
+        End If
+        Dim prefix As String = DatabasePath(database) + "/"
+        ' Document IDs are case-sensitive; "=" is not, so "_Design/x" must stay encoded as-is.
+        If String.StartsWith(documentID, "_design/", True) Then
+            Return prefix + "_design/" + EncodeComponent(String.Mid(documentID, 9))
+        End If
+        If String.StartsWith(documentID, "_local/", True) Then
+            Return prefix + "_local/" + EncodeComponent(String.Mid(documentID, 8))
+        End If
+        Return prefix + EncodeComponent(documentID)
+    End Function
+
+    Private Sub RequireObject(value As JSONItem)
+        If value = Nil Then
+            Throw New InvalidArgumentException("Expected a JSON object")
+        End If
+        If Not value.IsObject() Then
+            Throw New InvalidArgumentException("Expected a JSON object")
+        End If
+    End Sub
+
+    Private Function Request(method As String, requestPath As String, body As String = "") As JSONItem
+        If Me.TimeoutSeconds <= 0 Then
+            Throw New InvalidArgumentException("TimeoutSeconds must be positive")
+        End If
+        Dim connection As New URLConnection()
+        connection.Timeout = Me.TimeoutSeconds
+        connection.VerifySSL = True
+        connection.FollowRedirects = False
+        connection.RequestHeaders.Set("Accept", "application/json")
+        connection.RequestHeaders.Set("Content-Type", "application/json")
+        If Me.Authorization <> "" Then
+            connection.RequestHeaders.Set("Authorization", Me.Authorization)
+        End If
+        Dim response As String = connection.Send(method, Me.ServerURL + requestPath, body)
+        Return Me.ParseResponse(connection.HTTPStatus, response)
+    End Function
+
+    Private Function ParseResponse(status As Integer, response As String) As JSONItem
+        If status < 200 Or status >= 300 Then
+            Throw New CouchDBException(status, response)
+        End If
+        If response = "" Then
+            Return JSONItem.Null()
+        End If
+        Return Json.Parse(response)
+    End Function
+
+    Public Function ServerInfo() As JSONItem
+        Return Me.Request("GET", "/")
+    End Function
+
+    Public Function ListDatabases() As JSONItem
+        Return Me.Request("GET", "/_all_dbs")
+    End Function
+
+    Public Function DatabaseInfo(database As String) As JSONItem
+        Return Me.Request("GET", Me.DatabasePath(database))
+    End Function
+
+    Public Function CreateDatabase(database As String) As JSONItem
+        Return Me.Request("PUT", Me.DatabasePath(database))
+    End Function
+
+    Public Function DeleteDatabase(database As String) As JSONItem
+        Return Me.Request("DELETE", Me.DatabasePath(database))
+    End Function
+
+    Public Function GetDocument(database As String, documentID As String, revision As String = "", includeAttachments As Boolean = False) As JSONItem
+        Dim requestPath As String = Me.DocumentPath(database, documentID)
+        If revision <> "" Then
+            requestPath += "?rev=" + EncodeComponent(revision)
+        End If
+        If includeAttachments Then
+            If revision = "" Then
+                requestPath += "?attachments=true"
+            Else
+                requestPath += "&attachments=true"
+            End If
+        End If
+        Return Me.Request("GET", requestPath)
+    End Function
+
+    ''' Create with a generated ID, or the _id supplied in the document.
+    Public Function CreateDocument(database As String, document As JSONItem) As JSONItem
+        Me.RequireObject(document)
+        Return Me.Request("POST", Me.DatabasePath(database), Json.Stringify(document))
+    End Function
+
+    ''' Create or replace by ID. Existing documents require their current _rev.
+    Public Function PutDocument(database As String, documentID As String, document As JSONItem) As JSONItem
+        Me.RequireObject(document)
+        If document.HasKey("_id") Then
+            If String.Compare(document.Value("_id").AsString().Or(""), documentID, True) <> 0 Then
+                Throw New InvalidArgumentException("Document _id must match documentID")
+            End If
+        End If
+        Return Me.Request("PUT", Me.DocumentPath(database, documentID), Json.Stringify(document))
+    End Function
+
+    ''' Create or update a document and upload all supplied attachments in one PUT.
+    ''' Existing _attachments stubs are retained; supplied names replace those entries.
+    Public Function PutDocumentWithAttachments(database As String, documentID As String, document As JSONItem, attachments As Array Of CouchDBAttachment, revision As String = "") As JSONItem
+        Me.RequireObject(document)
+        Dim requestPath As String = Me.DocumentPath(database, documentID)
+        If Me.TimeoutSeconds <= 0 Then
+            Throw New InvalidArgumentException("TimeoutSeconds must be positive")
+        End If
+        If Array.Count(attachments) = 0 Then
+            Throw New InvalidArgumentException("Supply at least one attachment")
+        End If
+        ' Clone once: never mutate the caller's document or attachment metadata.
+        Dim payload As JSONItem = Json.Parse(Json.Stringify(document))
+        If payload.HasKey("_id") Then
+            If String.Compare(payload.Value("_id").AsString().Or(""), documentID, True) <> 0 Then
+                Throw New InvalidArgumentException("Document _id must match documentID")
+            End If
+        End If
+        If revision <> "" Then
+            If payload.HasKey("_rev") Then
+                If String.Compare(payload.Value("_rev").AsString().Or(""), revision, True) <> 0 Then
+                    Throw New InvalidArgumentException("Document _rev must match revision")
+                End If
+            End If
+            payload.Value("_rev") = revision
+        End If
+        Dim uploaded As JSONItem = JSONItem.NewObject()
+        For Each attachment As CouchDBAttachment In attachments
+            If attachment = Nil Then
+                Throw New InvalidArgumentException("Attachment cannot be Nil")
+            End If
+            If attachment.Name = "" Or attachment.Data = Nil Then
+                Throw New InvalidArgumentException("Attachment name and Bytes data are required")
+            End If
+            If uploaded.HasKey(attachment.Name) Then
+                Throw New InvalidArgumentException("Duplicate attachment name: " + attachment.Name)
+            End If
+            ValidateContentType(attachment.ContentType)
+            Dim metadata As JSONItem = JSONItem.NewObject()
+            metadata.Value("follows") = True
+            metadata.Value("content_type") = attachment.ContentType
+            metadata.Value("length") = attachment.Data.Count
+            uploaded.Value(attachment.Name) = metadata
+        Next
+        Dim metadata As JSONItem = JSONItem.NewObject()
+        If payload.HasKey("_attachments") Then
+            Dim existing As JSONItem = payload.Value("_attachments")
+            Me.RequireObject(existing)
+            For Each name As String In existing.Keys()
+                If Not uploaded.HasKey(name) Then
+                    Dim stub As JSONItem = existing.Value(name)
+                    Me.RequireObject(stub)
+                    If Not stub.Value("stub").AsBoolean().Or(False) Or stub.HasKey("data") Or stub.HasKey("follows") Then
+                        Throw New InvalidArgumentException("Retained attachments must be CouchDB stubs; supply Bytes for new content")
+                    End If
+                    metadata.Value(name) = stub
+                End If
+            Next
+        End If
+        ' Insert follows entries in exactly the same order as the binary parts.
+        For Each attachment As CouchDBAttachment In attachments
+            metadata.Value(attachment.Name) = uploaded.Value(attachment.Name)
+        Next
+        payload.Value("_attachments") = metadata
+        Dim jsonBody As String = Json.Stringify(payload)
+        Dim boundary As String = ""
+        While True
+            Dim randomBytes As New Bytes()
+            For i As Integer = 1 To 24
+                randomBytes.Append(Random.RandomInteger(0, 255))
+            Next
+            boundary = "BuoyCouchDB_" + randomBytes.ToHex()
+            Dim collision As Boolean = String.Contains(jsonBody, boundary, True)
+            Dim marker As Bytes = Bytes.FromString(boundary, Text.Encodings.UTF8)
+            For Each attachment As CouchDBAttachment In attachments
+                If ContainsBoundary(attachment.Data, marker) Then
+                    collision = True
+                    Exit For
+                End If
+            Next
+            If Not collision Then
+                Exit While
+            End If
+        End While
+        Const CRLF As String = "\r\n"
+        Dim body As New Bytes()
+        body.Append(Bytes.FromString("--" + boundary + CRLF + "Content-Type: application/json" + CRLF + CRLF + jsonBody, Text.Encodings.UTF8))
+        For Each attachment As CouchDBAttachment In attachments
+            body.Append(Bytes.FromString(CRLF + "--" + boundary + CRLF + "Content-Type: " + attachment.ContentType + CRLF + CRLF, Text.Encodings.UTF8))
+            body.Append(attachment.Data)
+        Next
+        body.Append(Bytes.FromString(CRLF + "--" + boundary + "--" + CRLF, Text.Encodings.UTF8))
+        Dim response As CouchDBBinaryResponse = Me.SendBinary("PUT", requestPath, "application/json", body, "multipart/related; boundary=\"" + boundary + "\"")
+        Return Me.ParseResponse(response.Status, ResponseText(response.Body))
+    End Function
+
+    Private Function SendBinary(method As String, requestPath As String, accept As String, body As Bytes, contentType As String = "") As CouchDBBinaryResponse
+        If Me.TimeoutSeconds <= 0 Then
+            Throw New InvalidArgumentException("TimeoutSeconds must be positive")
+        End If
+        Const CRLF As String = "\r\n"
+        Dim headers As String = "Accept: " + accept + CRLF
+        If contentType <> "" Then
+            headers += "Content-Type: " + contentType + CRLF
+        End If
+        If Me.Authorization <> "" Then
+            headers += "Authorization: " + Me.Authorization + CRLF
+        End If
+        Return SendCouchDBBinary(method, Me.ServerURL + requestPath, headers, body, Me.TimeoutSeconds)
+    End Function
+
+    Private Function AttachmentPath(database As String, documentID As String, name As String) As String
+        If name = "" Then
+            Throw New InvalidArgumentException("Attachment name is required")
+        End If
+        Return Me.DocumentPath(database, documentID) + "/" + EncodeComponent(name)
+    End Function
+
+    Private Function RevisionQuery(revision As String) As String
+        If revision = "" Then
+            Return ""
+        End If
+        Return "?rev=" + EncodeComponent(revision)
+    End Function
+
+    ''' Download one attachment's exact bytes. Supply a revision to read an older one.
+    Public Function GetAttachment(database As String, documentID As String, attachmentName As String, revision As String = "") As Bytes
+        Return Me.GetAttachmentWithType(database, documentID, attachmentName, revision).Data
+    End Function
+
+    ''' Download one attachment as name, exact bytes, and the server's Content-Type.
+    Public Function GetAttachmentWithType(database As String, documentID As String, name As String, revision As String = "") As CouchDBAttachment
+        Dim requestPath As String = Me.AttachmentPath(database, documentID, name) + Me.RevisionQuery(revision)
+        Dim response As CouchDBBinaryResponse = Me.SendBinary("GET", requestPath, "*/*", New Bytes())
+        If response.Status < 200 Or response.Status >= 300 Then
+            Throw New CouchDBException(response.Status, ResponseText(response.Body))
+        End If
+        Dim contentType As String = response.HeaderValue("Content-Type")
+        If contentType = "" Then
+            contentType = "application/octet-stream"
+        End If
+        Return New CouchDBAttachment(name, response.Body, contentType)
+    End Function
+
+    ''' Upload one attachment as raw bytes without resending the document body.
+    ''' Omit the revision only when creating a new document.
+    Public Function PutAttachment(database As String, documentID As String, attachment As CouchDBAttachment, revision As String = "") As JSONItem
+        If attachment = Nil Then
+            Throw New InvalidArgumentException("Attachment cannot be Nil")
+        End If
+        If attachment.Data = Nil Then
+            Throw New InvalidArgumentException("Attachment Bytes data is required")
+        End If
+        ValidateContentType(attachment.ContentType)
+        Dim requestPath As String = Me.AttachmentPath(database, documentID, attachment.Name) + Me.RevisionQuery(revision)
+        Dim response As CouchDBBinaryResponse = Me.SendBinary("PUT", requestPath, "application/json", attachment.Data, attachment.ContentType)
+        Return Me.ParseResponse(response.Status, ResponseText(response.Body))
+    End Function
+
+    Public Function DeleteAttachment(database As String, documentID As String, name As String, revision As String) As JSONItem
+        If revision = "" Then
+            Throw New InvalidArgumentException("Current document revision is required for attachment deletion")
+        End If
+        Return Me.Request("DELETE", Me.AttachmentPath(database, documentID, name) + Me.RevisionQuery(revision))
+    End Function
+
+    ''' Return the current revision from a HEAD request without downloading the document.
+    Public Function GetDocumentRevision(database As String, documentID As String) As String
+        Dim response As CouchDBBinaryResponse = Me.SendBinary("HEAD", Me.DocumentPath(database, documentID), "application/json", New Bytes())
+        If response.Status < 200 Or response.Status >= 300 Then
+            Throw New CouchDBException(response.Status, ResponseText(response.Body))
+        End If
+        Dim revision As String = response.HeaderValue("ETag")
+        If String.Left(revision, 1) = "\"" And String.Right(revision, 1) = "\"" And String.Len(revision) >= 2 Then
+            revision = String.Mid(revision, 2, String.Len(revision) - 2)
+        End If
+        If revision = "" Then
+            Throw New CouchDBException(response.Status, "Response did not include an ETag revision")
+        End If
+        Return revision
+    End Function
+
+    ''' Query a design document view. Options are the documented view parameters
+    ''' (key, keys, start_key, end_key, descending, include_docs, limit, skip, reduce, group, ...)
+    ''' sent as a JSON POST body, so keys of any JSON type need no URL encoding.
+    Public Function QueryView(database As String, designDocument As String, viewName As String, options As JSONItem) As JSONItem
+        Me.RequireObject(options)
+        Dim designName As String = designDocument
+        If String.StartsWith(designName, "_design/", True) Then
+            designName = String.Mid(designName, 9)
+        End If
+        If designName = "" Or viewName = "" Then
+            Throw New InvalidArgumentException("Design document and view names are required")
+        End If
+        Dim requestPath As String = Me.DatabasePath(database) + "/_design/" + EncodeComponent(designName) + "/_view/" + EncodeComponent(viewName)
+        Return Me.Request("POST", requestPath, Json.Stringify(options))
+    End Function
+
+    ''' Read the changes feed once (normal or longpoll). doc_ids or selector options are sent in a
+    ''' POST body with the matching built-in filter; every other option becomes a query parameter.
+    Public Function Changes(database As String, options As JSONItem) As JSONItem
+        Me.RequireObject(options)
+        Dim query As String = ""
+        Dim body As JSONItem = JSONItem.NewObject()
+        Dim filter As String = ""
+        Dim isLongPoll As Boolean = False
+        Dim serverTimeout As Double = -1
+        For Each name As String In options.Keys()
+            Dim item As JSONItem = options.Value(name)
+            If IsExactly(name, "doc_ids") Or IsExactly(name, "selector") Then
+                If filter <> "" Then
+                    Throw New InvalidArgumentException("Use either doc_ids or selector, not both")
+                End If
+                If IsExactly(name, "doc_ids") And Not item.IsArray() Then
+                    Throw New InvalidArgumentException("doc_ids must be an array")
+                End If
+                If IsExactly(name, "selector") Then
+                    Me.RequireObject(item)
+                End If
+                filter = "_" + name
+                body.Value(name) = item
+            Else
+                Dim value As String = ""
+                If item.IsString() Then
+                    value = item.AsString().Or("")
+                ElseIf item.IsBoolean() Then
+                    If item.AsBoolean().Or(False) Then
+                        value = "true"
+                    Else
+                        value = "false"
+                    End If
+                Else
+                    value = Json.Stringify(item)
+                End If
+                If IsExactly(name, "feed") Then
+                    If IsExactly(value, "longpoll") Then
+                        isLongPoll = True
+                    ElseIf Not IsExactly(value, "normal") Then
+                        Throw New InvalidArgumentException("Only normal and longpoll feeds are supported by this synchronous client")
+                    End If
+                End If
+                If IsExactly(name, "timeout") Then
+                    serverTimeout = Double.Parse(value).Or(-1)
+                End If
+                If query = "" Then
+                    query = "?"
+                Else
+                    query += "&"
+                End If
+                query += EncodeComponent(name) + "=" + EncodeComponent(value)
+            End If
+        Next
+        If isLongPoll Then
+            If serverTimeout <= 0 Or serverTimeout >= Me.TimeoutSeconds * 1000.0 Then
+                Throw New InvalidArgumentException("A longpoll feed needs a numeric timeout (ms) shorter than TimeoutSeconds")
+            End If
+        End If
+        Dim requestPath As String = Me.DatabasePath(database) + "/_changes"
+        If filter = "" Then
+            Return Me.Request("GET", requestPath + query)
+        End If
+        If options.HasKey("filter") Then
+            Throw New InvalidArgumentException("doc_ids and selector select their own built-in filter")
+        End If
+        If query = "" Then
+            query = "?"
+        Else
+            query += "&"
+        End If
+        Return Me.Request("POST", requestPath + query + "filter=" + filter, Json.Stringify(body))
+    End Function
+
+    ''' Ask the server for count new document IDs (returned in the "uuids" array).
+    Public Function UUIDs(count As Integer = 1) As JSONItem
+        If count < 1 Then
+            Throw New InvalidArgumentException("UUID count must be at least 1")
+        End If
+        Return Me.Request("GET", "/_uuids?count=" + Str(count))
+    End Function
+
+    Public Function DeleteDocument(database As String, documentID As String, revision As String) As JSONItem
+        If revision = "" Then
+            Throw New InvalidArgumentException("Current document revision is required for deletion")
+        End If
+        Return Me.Request("DELETE", Me.DocumentPath(database, documentID) + "?rev=" + EncodeComponent(revision))
+    End Function
+
+    ''' Pass CouchDB _all_docs options as a JSON object (keys, limit, include_docs, etc.).
+    Public Function AllDocuments(database As String, options As JSONItem) As JSONItem
+        Me.RequireObject(options)
+        Return Me.Request("POST", Me.DatabasePath(database) + "/_all_docs", Json.Stringify(options))
+    End Function
+
+    ''' Pass the complete Mango request including selector and optional bookmark.
+    Public Function Find(database As String, query As JSONItem) As JSONItem
+        Me.RequireObject(query)
+        Dim criteria As JSONItem = query.Value("selector")
+        Me.RequireObject(criteria)
+        Return Me.Request("POST", Me.DatabasePath(database) + "/_find", Json.Stringify(query))
+    End Function
+
+    Public Function CreateIndex(database As String, definition As JSONItem) As JSONItem
+        Me.RequireObject(definition)
+        Return Me.Request("POST", Me.DatabasePath(database) + "/_index", Json.Stringify(definition))
+    End Function
+
+    ''' Returns per-document results. A successful HTTP response can contain errors.
+    Public Function BulkDocuments(database As String, documents As JSONItem) As JSONItem
+        If documents = Nil Then
+            Throw New InvalidArgumentException("Expected an array of documents")
+        End If
+        If Not documents.IsArray() Then
+            Throw New InvalidArgumentException("Expected an array of documents")
+        End If
+        For i As Integer = 0 To documents.Count() - 1
+            Dim document As JSONItem = documents.ValueAt(i)
+            Me.RequireObject(document)
+        Next
+        Dim body As JSONItem = JSONItem.NewObject()
+        body.Value("docs") = documents
+        Return Me.Request("POST", Me.DatabasePath(database) + "/_bulk_docs", Json.Stringify(body))
+    End Function
+End Class

@@ -1,0 +1,25 @@
+Import couchdb
+
+' Read-only example. Credentials are read from the environment.
+Sub Main()
+    Dim server As String = System.EnvironmentVariable("COUCHDB_URL").Or("http://127.0.0.1:5984")
+    Dim username As String = System.EnvironmentVariable("COUCHDB_USERNAME").Or("")
+    Dim password As String = System.EnvironmentVariable("COUCHDB_PASSWORD").Or("")
+    Dim client As New CouchDBClient(server, username, password)
+    Try
+        Print Json.Stringify(client.ServerInfo())
+        Dim database As String = System.EnvironmentVariable("COUCHDB_DATABASE").Or("")
+        If database <> "" Then
+            Dim query As JSONItem = JSONItem.NewObject()
+            query.Value("selector") = JSONItem.NewObject()
+            query.Value("limit") = 10.0
+            Print Json.Stringify(client.Find(database, query))
+        End If
+    Catch e As CouchDBException
+        Print "HTTP " + Str(e.Status) + ": " + e.ErrorName + " " + e.Reason
+        Throw e
+    Catch e As NetworkingException
+        Print "Connection failed: " + e.Message
+        Throw e
+    End Try
+End Sub

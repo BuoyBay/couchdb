@@ -1,0 +1,288 @@
+' Internal binary transport for attachments and multipart bodies. Never convert payloads to String.
+Public Class CouchDBBinaryResponse
+    Public Property Status As Integer
+    Public Property Body As Bytes = New Bytes()
+    Public Property RawHeaders As Bytes = New Bytes()
+
+    ''' The named header from the final response (after any 1xx), or empty if absent.
+    Public Function HeaderValue(name As String) As String
+        Dim found As String = ""
+        For Each line As String In String.Split(Me.RawHeaders.ToString(Text.Encodings.Latin1), "\n")
+            Dim trimmed As String = String.Trim(line)
+            If String.StartsWith(trimmed, "HTTP/") Then
+                found = ""
+            Else
+                Dim colon As Integer = String.IndexOf(trimmed, ":")
+                If colon > 0 Then
+                    If String.Trim(String.Left(trimmed, colon)) = name Then
+                        found = String.Trim(String.Mid(trimmed, colon + 2))
+                    End If
+                End If
+            End If
+        Next
+        Return found
+    End Function
+End Class
+
+#If TargetWindows Then
+Sequential Structure CouchDBURLComponents
+    StructSize As UInt32
+    SchemeText As Ptr
+    SchemeLength As UInt32
+    Scheme As Int32
+    HostText As Ptr
+    HostLength As UInt32
+    Port As UInt16
+    UserText As Ptr
+    UserLength As UInt32
+    PasswordText As Ptr
+    PasswordLength As UInt32
+    PathText As Ptr
+    PathLength As UInt32
+    ExtraText As Ptr
+    ExtraLength As UInt32
+End Structure
+
+Declare Function BinaryWinOpen Lib "winhttp" Alias "WinHttpOpen" (agent As Ptr, access As UInt32, proxy As Ptr, bypass As Ptr, requestFlags As UInt32) As Ptr
+Declare Function BinaryWinCrackURL Lib "winhttp" Alias "WinHttpCrackUrl" (url As Ptr, length As UInt32, requestFlags As UInt32, ByRef parts As CouchDBURLComponents) As Int32
+Declare Function BinaryWinConnect Lib "winhttp" Alias "WinHttpConnect" (session As Ptr, host As Ptr, port As UInt16, reserved As UInt32) As Ptr
+Declare Function BinaryWinOpenRequest Lib "winhttp" Alias "WinHttpOpenRequest" (connection As Ptr, verb As Ptr, target As Ptr, version As Ptr, referrer As Ptr, accepts As Ptr, requestFlags As UInt32) As Ptr
+Declare Function BinaryWinTimeouts Lib "winhttp" Alias "WinHttpSetTimeouts" (session As Ptr, resolve As Int32, connect As Int32, send As Int32, receive As Int32) As Int32
+Declare Function BinaryWinSetOption Lib "winhttp" Alias "WinHttpSetOption" (request As Ptr, code As UInt32, ByRef value As UInt32, length As UInt32) As Int32
+Declare Function BinaryWinSend Lib "winhttp" Alias "WinHttpSendRequest" (request As Ptr, headers As Ptr, headerLength As UInt32, data As Ptr, length As UInt32, total As UInt32, context As UInt64) As Int32
+Declare Function BinaryWinReceive Lib "winhttp" Alias "WinHttpReceiveResponse" (request As Ptr, reserved As Ptr) As Int32
+Declare Function BinaryWinHeaders Lib "winhttp" Alias "WinHttpQueryHeaders" (request As Ptr, level As UInt32, name As Ptr, ByRef status As UInt32, ByRef length As UInt32, index As Ptr) As Int32
+Declare Function BinaryWinRawHeaders Lib "winhttp" Alias "WinHttpQueryHeaders" (request As Ptr, level As UInt32, name As Ptr, buffer As Ptr, ByRef length As UInt32, index As Ptr) As Int32
+Declare Function BinaryWinRead Lib "winhttp" Alias "WinHttpReadData" (request As Ptr, buffer As Ptr, length As UInt32, ByRef received As UInt32) As Int32
+Declare Function BinaryWinClose Lib "winhttp" Alias "WinHttpCloseHandle" (handle As Ptr) As Int32
+Declare Function BinaryWinError Lib "kernel32" Alias "GetLastError" () As UInt32
+
+Private Sub WinCheck(succeeded As Int32)
+    If succeeded = 0 Then
+        Throw New NetworkingException("WinHTTP binary request failed", BinaryWinError())
+    End If
+End Sub
+
+Private Function WideString(value As String) As Bytes
+    Dim data As Bytes = Bytes.FromString(value, Text.Encodings.UTF16LE)
+    data.Append(0)
+    data.Append(0)
+    Return data
+End Function
+
+Private Function WidePart(data As Ptr, length As UInt32) As String
+    Dim buffer As New Bytes()
+    If length > 0 Then
+        buffer.Append(data, length * 2)
+    End If
+    Return buffer.ToString(Text.Encodings.UTF16LE)
+End Function
+
+''' WinHTTP needs no process-wide setup; present so callers can initialize on every platform.
+Public Sub CouchDBInitializeTransport()
+End Sub
+
+Public Function SendCouchDBBinary(method As String, url As String, headers As String, body As Bytes, timeout As Integer) As CouchDBBinaryResponse
+    If body.Count > 4294967295 Then
+        Throw New InvalidArgumentException("WinHTTP multipart bodies must be smaller than 4 GiB")
+    End If
+    Dim wideURL As Bytes = WideString(url)
+    Dim parts As CouchDBURLComponents
+    parts.StructSize = 104 ' sizeof(URL_COMPONENTS) on supported 64-bit targets
+    parts.HostLength = 4294967295
+    parts.PathLength = 4294967295
+    parts.ExtraLength = 4294967295
+    WinCheck(BinaryWinCrackURL(wideURL.DataPtr(), 0, 0, parts))
+    Dim host As Bytes = WideString(WidePart(parts.HostText, parts.HostLength))
+    Dim target As Bytes = WideString(WidePart(parts.PathText, parts.PathLength) + WidePart(parts.ExtraText, parts.ExtraLength))
+    Dim verb As Bytes = WideString(method)
+    Dim agent As Bytes = WideString("Buoy-CouchDB")
+    Dim wideHeaders As Bytes = WideString(headers)
+    Dim session As Ptr = Nil
+    Dim connection As Ptr = Nil
+    Dim request As Ptr = Nil
+    Dim response As New CouchDBBinaryResponse()
+    Try
+        session = BinaryWinOpen(agent.DataPtr(), 0, Nil, Nil, 0)
+        If session = Nil Then
+            Throw New NetworkingException("Cannot open WinHTTP session", BinaryWinError())
+        End If
+        Dim milliseconds As Int32 = Math.Min(timeout, 2147483) * 1000
+        WinCheck(BinaryWinTimeouts(session, milliseconds, milliseconds, milliseconds, milliseconds))
+        connection = BinaryWinConnect(session, host.DataPtr(), parts.Port, 0)
+        If connection = Nil Then
+            Throw New NetworkingException("Cannot connect WinHTTP session", BinaryWinError())
+        End If
+        Dim requestFlags As UInt32 = 0
+        If parts.Scheme = 2 Then
+            requestFlags = 8388608 ' WINHTTP_FLAG_SECURE; retain default certificate checks
+        End If
+        request = BinaryWinOpenRequest(connection, verb.DataPtr(), target.DataPtr(), Nil, Nil, Nil, requestFlags)
+        If request = Nil Then
+            Throw New NetworkingException("Cannot open WinHTTP request", BinaryWinError())
+        End If
+        Dim disabled As UInt32 = 6 ' WINHTTP_DISABLE_REDIRECTS Or WINHTTP_DISABLE_AUTHENTICATION
+        WinCheck(BinaryWinSetOption(request, 63, disabled, 4))
+        Dim bodyData As Ptr = Nil
+        If body.Count > 0 Then
+            bodyData = body.DataPtr()
+        End If
+        WinCheck(BinaryWinSend(request, wideHeaders.DataPtr(), 4294967295, bodyData, body.Count, body.Count, 0))
+        WinCheck(BinaryWinReceive(request, Nil))
+        Dim status As UInt32 = 0
+        Dim statusLength As UInt32 = 4
+        WinCheck(BinaryWinHeaders(request, 536870931, Nil, status, statusLength, Nil))
+        response.Status = status
+        ' The first query only reports the byte size of the CRLF-separated raw headers.
+        Dim headerLength As UInt32 = 0
+        BinaryWinRawHeaders(request, 22, Nil, Nil, headerLength, Nil) ' WINHTTP_QUERY_RAW_HEADERS_CRLF
+        If headerLength > 0 Then
+            Dim headerBuffer As New Bytes(headerLength)
+            For i As Integer = 1 To headerLength
+                headerBuffer.Append(0)
+            Next
+            WinCheck(BinaryWinRawHeaders(request, 22, Nil, headerBuffer.DataPtr(), headerLength, Nil))
+            response.RawHeaders = Bytes.FromString(WidePart(headerBuffer.DataPtr(), headerLength \ 2), Text.Encodings.UTF8)
+        End If
+        Dim chunk As New Bytes(16384)
+        For i As Integer = 1 To 16384
+            chunk.Append(0)
+        Next
+        While True
+            Dim received As UInt32 = 0
+            WinCheck(BinaryWinRead(request, chunk.DataPtr(), 16384, received))
+            If received = 0 Then
+                Exit While
+            End If
+            response.Body.Append(chunk.DataPtr(), received)
+        End While
+    Finally
+        If request <> Nil Then
+            BinaryWinClose(request)
+        End If
+        If connection <> Nil Then
+            BinaryWinClose(connection)
+        End If
+        If session <> Nil Then
+            BinaryWinClose(session)
+        End If
+    End Try
+    Return response
+End Function
+#Else
+' libcurl is supplied by macOS and is already required by Buoy's Linux HTTP runtime.
+Sequential Structure CouchDBCurlStatus
+    Value As Integer
+End Structure
+
+Declare Function BinaryCurlInit Lib "couchdb_curl" Alias "curl_easy_init" () As Ptr
+Declare Sub BinaryCurlFree Lib "couchdb_curl" Alias "curl_easy_cleanup" (handle As Ptr)
+Declare Function BinaryCurlOption Lib "couchdb_curl" Alias "curl_easy_setopt" (handle As Ptr, optionCode As Int32, ...) As Int32
+Declare Function BinaryCurlPerform Lib "couchdb_curl" Alias "curl_easy_perform" (handle As Ptr) As Int32
+Declare Function BinaryCurlInfo Lib "couchdb_curl" Alias "curl_easy_getinfo" (handle As Ptr, info As Int32, ...) As Int32
+Declare Function BinaryCurlError Lib "couchdb_curl" Alias "curl_easy_strerror" (code As Int32) As CString
+Declare Function BinaryCurlHeader Lib "couchdb_curl" Alias "curl_slist_append" (headers As Ptr, value As String) As Ptr
+Declare Sub BinaryCurlFreeHeaders Lib "couchdb_curl" Alias "curl_slist_free_all" (headers As Ptr)
+Declare Function BinaryCurlGlobalInit Lib "couchdb_curl" Alias "curl_global_init" (initFlags As Int64) As Int32
+
+' A constant initializer is folded into static storage, so there is no lazy-init race.
+Class CouchDBTransportState
+    Public Shared Property Initialized As Boolean = False
+End Class
+
+
+Private Sub CurlCheck(code As Int32, operation As String = "request")
+    If code <> 0 Then
+        Throw New NetworkingException("Binary HTTP " + operation + ": " + CType(BinaryCurlError(code), String), code)
+    End If
+End Sub
+
+Private Function OnBinaryCurlData(data As Ptr, size As UInt64, count As UInt64, context As Ptr) As UInt64
+    ' Exceptions cannot cross the C callback boundary.
+    Try
+        Dim response As CouchDBBinaryResponse = CType(context, CouchDBBinaryResponse)
+        Dim length As Integer = size * count
+        response.Body.Append(data, length)
+        Return length
+    Catch
+        Return 0
+    End Try
+End Function
+
+Private Function OnBinaryCurlHeader(data As Ptr, size As UInt64, count As UInt64, context As Ptr) As UInt64
+    Try
+        Dim response As CouchDBBinaryResponse = CType(context, CouchDBBinaryResponse)
+        Dim length As Integer = size * count
+        response.RawHeaders.Append(data, length)
+        Return length
+    Catch
+        Return 0
+    End Try
+End Function
+
+''' Runs curl_global_init once. libcurl before 7.84 does not make that call thread-safe,
+''' so call this on the main thread before starting worker requests. Later calls are no-ops.
+Public Sub CouchDBInitializeTransport()
+    If CouchDBTransportState.Initialized Then Return
+    CurlCheck(BinaryCurlGlobalInit(3), "initialization") ' CURL_GLOBAL_DEFAULT
+    CouchDBTransportState.Initialized = True
+End Sub
+
+Public Function SendCouchDBBinary(method As String, url As String, headers As String, body As Bytes, timeout As Integer) As CouchDBBinaryResponse
+    ' Fallback for callers that skipped CouchDBInitializeTransport.
+    CouchDBInitializeTransport()
+    Dim handle As Ptr = BinaryCurlInit()
+    If handle = Nil Then
+        Throw New NetworkingException("Cannot initialize binary HTTP request")
+    End If
+    Dim headerList As Ptr = Nil
+    Dim response As New CouchDBBinaryResponse()
+    Try
+        For Each line As String In String.Split(headers, "\r\n")
+            If line <> "" Then
+                Dim appended As Ptr = BinaryCurlHeader(headerList, line)
+                If appended = Nil Then
+                    Throw New NetworkingException("Cannot allocate HTTP headers")
+                End If
+                headerList = appended
+            End If
+        Next
+        CurlCheck(BinaryCurlOption(handle, 10002, url), "option 10002") ' CURLOPT_URL
+        CurlCheck(BinaryCurlOption(handle, 10023, headerList), "option 10023") ' CURLOPT_HTTPHEADER
+        ' Zero-byte bodies still need a non-NULL buffer: NULL POSTFIELDS would read stdin.
+        Dim placeholder As New Bytes()
+        placeholder.Append(0)
+        If body.Count > 0 Or method = "PUT" Or method = "POST" Then
+            Dim bodyData As Ptr = placeholder.DataPtr()
+            If body.Count > 0 Then
+                bodyData = body.DataPtr()
+            End If
+            CurlCheck(BinaryCurlOption(handle, 30120, body.Count), "option 30120") ' CURLOPT_POSTFIELDSIZE_LARGE
+            CurlCheck(BinaryCurlOption(handle, 10015, bodyData), "option 10015") ' CURLOPT_POSTFIELDS
+            CurlCheck(BinaryCurlOption(handle, 10036, method), "option 10036") ' CURLOPT_CUSTOMREQUEST
+        ElseIf method = "HEAD" Then
+            CurlCheck(BinaryCurlOption(handle, 44, 1), "option 44") ' CURLOPT_NOBODY
+        ElseIf method <> "GET" Then
+            CurlCheck(BinaryCurlOption(handle, 10036, method), "option 10036") ' CURLOPT_CUSTOMREQUEST
+        End If
+        CurlCheck(BinaryCurlOption(handle, 20011, CType(AddressOf OnBinaryCurlData, Ptr)), "option 20011")
+        CurlCheck(BinaryCurlOption(handle, 10001, CType(response, Ptr)), "option 10001") ' CURLOPT_WRITEDATA
+        CurlCheck(BinaryCurlOption(handle, 20079, CType(AddressOf OnBinaryCurlHeader, Ptr)), "option 20079") ' CURLOPT_HEADERFUNCTION
+        CurlCheck(BinaryCurlOption(handle, 10029, CType(response, Ptr)), "option 10029") ' CURLOPT_HEADERDATA
+        CurlCheck(BinaryCurlOption(handle, 13, timeout), "option 13") ' CURLOPT_TIMEOUT
+        CurlCheck(BinaryCurlOption(handle, 99, 1), "option 99") ' CURLOPT_NOSIGNAL
+        CurlCheck(BinaryCurlOption(handle, 52, 0), "option 52") ' CURLOPT_FOLLOWLOCATION
+        ' TLS peer and hostname verification retain libcurl's enabled defaults.
+        CurlCheck(BinaryCurlPerform(handle))
+        Dim status As CouchDBCurlStatus
+        CurlCheck(BinaryCurlInfo(handle, 2097154, CType(status, Ptr)), "response status") ' CURLINFO_RESPONSE_CODE
+        response.Status = status.Value
+    Finally
+        BinaryCurlFree(handle)
+        If headerList <> Nil Then
+            BinaryCurlFreeHeaders(headerList)
+        End If
+    End Try
+    Return response
+End Function
+#End If

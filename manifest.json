@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "name": "couchdb",
+  "version": "0.3.0",
+  "description": "CouchDB client with views, changes, binary attachments, and multipart uploads",
+  "platforms": [
+    "arm64-apple-macos",
+    "x86_64-apple-macos",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "arm64-pc-windows-msvc"
+  ],
+  "libraries": [
+    {
+      "libName": "couchdb_curl",
+      "system": true,
+      "minVersion": "7.32.0"
+    }
+  ]
+}

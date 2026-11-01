@@ -1,0 +1,2 @@
+/* Link to the same system libcurl required by Buoy HTTP. */
+INPUT ( libcurl.so.4 )

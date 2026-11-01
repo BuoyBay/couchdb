@@ -1,0 +1,38 @@
+Import couchdb
+
+' Usage: couchdb-upload document-id file1 [file2 ...]
+' COUCHDB_DATABASE must name an existing database. This example creates a new document.
+Sub Main(args As Array Of String)
+    If Array.Count(args) < 3 Then
+        Throw New InvalidArgumentException("Usage: couchdb-upload document-id file1 [file2 ...]")
+    End If
+    Dim database As String = System.EnvironmentVariable("COUCHDB_DATABASE").Or("")
+    If database = "" Then
+        Throw New InvalidArgumentException("Set COUCHDB_DATABASE to an existing database")
+    End If
+    Dim client As New CouchDBClient(System.EnvironmentVariable("COUCHDB_URL").Or("http://127.0.0.1:5984"), System.EnvironmentVariable("COUCHDB_USERNAME").Or(""), System.EnvironmentVariable("COUCHDB_PASSWORD").Or(""))
+    Dim attachments As Array Of CouchDBAttachment = []
+    For i As Integer = 2 To Array.Count(args) - 1
+        Dim file As New FileSystemItem(args(i))
+        Dim opened As Result Of BinaryStream, IOError = BinaryStream.Open(file, False)
+        If opened.IsErr Then
+            Throw New Exception("Cannot open attachment: " + args(i))
+        End If
+        Dim stream As BinaryStream = opened.Value
+        Dim data As Bytes
+        Try
+            data = stream.Read(stream.Length)
+            If stream.LastError.HasValue Then
+                Throw New Exception("Cannot read attachment: " + args(i))
+            End If
+        Finally
+            stream.Close()
+        End Try
+        ' For a known file format, pass its MIME type as the third argument.
+        attachments.Append(New CouchDBAttachment(file.Name(), data))
+    Next
+    Dim document As JSONItem = JSONItem.NewObject()
+    document.Value("title") = "Document with multiple attachments"
+    Dim response As JSONItem = client.PutDocumentWithAttachments(database, args(1), document, attachments)
+    Print Json.Stringify(response)
+End Sub
