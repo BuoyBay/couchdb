@@ -2,7 +2,7 @@
     "schema": 1,
     "name": "couchdb",
     "version": "0.3.0",
-    "description": "CouchDB documents, views, changes, attachments",
+    "description": "CouchDB documents, views, changes",
     "platforms": [
         "arm64-apple-macos",
         "x86_64-apple-macos",
