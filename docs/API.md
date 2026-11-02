@@ -211,9 +211,3 @@ Catch `CouchDBException` for any non-2xx HTTP response. It exposes:
 `JSONException` propagates if a successful response contains malformed JSON.
 Invalid local arguments throw `InvalidArgumentException`. Database name rules,
 index definitions, and query semantics are validated by CouchDB itself.
-
-## Verification
-
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-

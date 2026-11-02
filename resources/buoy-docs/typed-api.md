@@ -69,8 +69,6 @@ An HTTP failure, including CouchDB's error fields and the unmodified response.
 
 Returns: no value.
 
-## CouchDB functions
-
 ### EncodeComponent
 
 `Public Function EncodeComponent(value As String) As String`
@@ -571,8 +569,6 @@ The named header from the final response (after any 1xx), or empty if absent.
 | `PathLength` | `UInt32` | — | — |
 | `ExtraText` | `Ptr` | — | — |
 | `ExtraLength` | `UInt32` | — | — |
-
-## CouchDBHTTP functions
 
 ### CouchDBInitializeTransport
 

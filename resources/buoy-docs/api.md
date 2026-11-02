@@ -37,5 +37,4 @@ A 409 conflict is returned to the caller without retry or resolution. Names, doc
 - [Getting started](getting-started.md)
 - [API reference](api.md)
 
-
 [Full typed API: properties, parameters, defaults, and returns](typed-api.md)

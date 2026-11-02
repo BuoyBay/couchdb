@@ -1,6 +1,6 @@
 # Query CouchDB documents, views, changes and attachments
 
-A Buoy source client for CouchDB's HTTP API. Requests are synchronous;
+A source client for CouchDB's HTTP API. Requests are synchronous;
 use a worker thread for calls from a graphical application. The current release
 covers databases, documents, design-document views, one-shot and longpoll changes
 feeds, UUIDs, raw single-attachment download/upload/delete, HEAD revision checks,
@@ -21,7 +21,7 @@ consumer project for reproducible installs.
 
 ## Example
 
-```buoy
+```basic
 Import couchdb
 
 Sub Main()
@@ -56,7 +56,6 @@ On your own machine, install Buoy and run:
 buoy ai init --both
 ```
 
-The generated agent files and editor settings stay local and are ignored by Git.
 
 ## Contributing
 

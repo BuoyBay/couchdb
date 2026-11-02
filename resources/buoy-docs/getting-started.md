@@ -13,7 +13,7 @@ Copy the couchdb archive into your project packages directory and use the import
 
 Run network work away from the GUI thread. TimeoutSeconds defaults to 30 and must be positive. Do not mutate client configuration or attachment buffers concurrently with a request.
 
-```buoy
+```basic
 Import couchdb
 
 Sub Main()
