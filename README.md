@@ -1,4 +1,4 @@
-# Query CouchDB documents, views, changes and attachments
+# CouchDB documents, views, changes, attachments
 
 A source client for CouchDB's HTTP API. Requests are synchronous;
 use a worker thread for calls from a graphical application. The current release
